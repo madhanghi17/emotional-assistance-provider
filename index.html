@@ -1,1 +1,239 @@
-https://ca9c9f27-257d-4a21-aa6e-2590d1eac3c0-00-1hjlsicfao6yq.sisko.replit.dev:3000/
+import os
+import gradio as gr
+import random
+import re
+
+# -----------------------------
+# Emotion detection + strategies
+# -----------------------------
+EMOTION_KEYWORDS = {
+    "happy": ["happy", "glad", "joy", "excited", "great", "delighted", "🙂", "😊", "😄", "😀"],
+    "sad": ["sad", "down", "unhappy", "depressed", "😢", "😔", "😞"],
+    "anxious": ["anxious", "anxiety", "nervous", "worried", "panic", "😰", "😟", "😬"],
+    "angry": ["angry", "mad", "furious", "irritated", "annoyed", "😡", "😠"],
+    "tired": ["tired", "exhausted", "sleepy", "fatigued", "😴"],
+    "lonely": ["lonely", "alone", "isolated", "😔"],
+}
+
+COPING_STRATEGIES = {
+    "happy": [
+        "That's lovely — celebrate a little! Would you like a short suggestion to extend this mood (song, micro-activity)?",
+        "Share what's good! Speaking about it can help you savor the moment."
+    ],
+    "sad": [
+        "I'm sorry you're feeling sad. Would you like a guided 60-second breathing exercise or a small comforting suggestion?",
+        "It makes sense to feel that way. If you'd like, tell me one thing that helped in the past and we can try it again."
+    ],
+    "anxious": [
+        "Try a simple grounding: name 5 things you can see, 4 you can touch, 3 you can hear, 2 you can smell, 1 you can taste. Want to try together?",
+        "A paced breathing (inhale 4s — exhale 6s, repeat 4 times) often helps. Want me to lead a round?"
+    ],
+    "angry": [
+        "Anger is valid. Consider a short physical reset — stand, stretch or walk for 1-2 minutes. Want a short vent space?",
+        "If safe, writing for 60 seconds about what frustrated you can help release tension. Would you like a prompt?"
+    ],
+    "tired": [
+        "You might benefit from a micro-rest: close your eyes for 60 seconds, sip water, or stretch gently. Want a short timer?",
+        "If possible, a 15–20 minute nap refreshes many people. Otherwise, a change of activity sometimes helps."
+    ],
+    "lonely": [
+        "Feeling lonely is painful. Would you like a small message prompt you can send to a friend or a short distraction activity?",
+        "Connecting with one small social step (a message or a 5-min call) can help. Want a suggested message?"
+    ],
+    "unsure": [
+        "I couldn't detect your emotion clearly. Could you say one word (sad / anxious / happy / angry / tired / lonely) or an emoji?",
+        "If it's easier, tell me whether you'd like calming, cheering up, or practical help."
+    ]
+}
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def normalize_text(t):
+    if t is None:
+        return ""
+    return "".join(c for c in t.lower().strip() if c.isalnum() or c.isspace())
+
+def detect_emotion(text):
+    """
+    Very simple keyword/emoji based detector.
+    Returns one of EMOTION_KEYWORDS keys, or 'unsure' if nothing matches.
+    """
+    if not text:
+        return "unsure"
+    low = text.lower()
+    scores = {k: 0 for k in EMOTION_KEYWORDS}
+    for emo, keywords in EMOTION_KEYWORDS.items():
+        for w in keywords:
+            if w in low:
+                scores[emo] += 1
+    top = max(scores, key=lambda k: scores[k])
+    if scores[top] == 0:
+        return "unsure"
+    return top
+
+def crisis_screen(text):
+    """
+    Basic crisis detection. If user expresses intent to self-harm or immediate danger,
+    return True so we respond with crisis-safe wording.
+    NOTE: This is a simple heuristic and not a substitute for professional crisis detection.
+    """
+    if not text:
+        return False
+    low = text.lower()
+    triggers = ["suicide", "kill myself", "i want to die", "end my life", "hurt myself", "i'll die"]
+    return any(t in low for t in triggers)
+
+def format_strategy(emotion):
+    if emotion in COPING_STRATEGIES:
+        return random.choice(COPING_STRATEGIES[emotion])
+    return random.choice(COPING_STRATEGIES["unsure"])
+
+# -----------------------------
+# Chatbot logic (same interface as your GK version)
+# -----------------------------
+def get_reply(user_message, chat_history, state):
+    """
+    state keys:
+      mode: "idle" or "support"
+      last_emotion: last detected emotion (string)
+      session_log: list of dicts with short history of interactions (optional)
+    Returns: normalized chat history and new state (matching your previous structure)
+    """
+    # Normalize previous history into dict messages (Gradio-friendly)
+    normalized = []
+    if chat_history:
+        for item in chat_history:
+            if isinstance(item, dict) and "role" in item and "content" in item:
+                normalized.append(item)
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                user, bot = item
+                normalized.append({"role": "user", "content": str(user)})
+                normalized.append({"role": "assistant", "content": str(bot)})
+            else:
+                normalized.append({"role": "assistant", "content": str(item)})
+
+    # Ensure state keys exist
+    mode = state.get("mode", "idle") if state else "idle"
+    last_emotion = state.get("last_emotion", None) if state else None
+    session_log = state.get("session_log", []) if state else []
+
+    user_text = (user_message or "").strip()
+    cmd = user_text.lower().strip()
+
+    # Commands: start support, stop/quit, help, moodlog
+    if cmd in ("start support", "support", "start"):
+        mode = "support"
+        normalized.append({"role": "user", "content": user_message})
+        normalized.append({"role": "assistant", "content": "Support mode activated. Tell me how you're feeling in one sentence or an emoji (e.g., 'anxious', 'sad', '🙂')."})
+        new_state = {"mode": mode, "last_emotion": None, "session_log": session_log}
+        return normalized, new_state
+
+    if cmd in ("quit", "stop", "exit"):
+        mode = "idle"
+        normalized.append({"role": "user", "content": user_message})
+        normalized.append({"role": "assistant", "content": "Support ended. If you want to start again, type 'start support'."})
+        new_state = {"mode": "idle", "last_emotion": None, "session_log": session_log}
+        return normalized, new_state
+
+    if cmd in ("help", "commands"):
+        normalized.append({"role": "user", "content": user_message})
+        help_text = (
+            "I can offer quick emotion-aware support. Commands:\n"
+            "- 'start support' or 'support' to begin\n"
+            "- Say how you feel (one word or sentence) and I'll respond with validation + a coping suggestion\n"
+            "- 'quit' to stop support\n"
+            "- 'moodlog' to see recent detected emotions this session\n"
+        )
+        normalized.append({"role": "assistant", "content": help_text})
+        new_state = {"mode": mode, "last_emotion": last_emotion, "session_log": session_log}
+        return normalized, new_state
+
+    if cmd == "moodlog":
+        normalized.append({"role": "user", "content": user_message})
+        if not session_log:
+            normalized.append({"role": "assistant", "content": "No mood entries yet. Start support and tell me how you feel to log an entry."})
+        else:
+            # show last 10 entries
+            entries = "\n".join(f"{i+1}. {e['emotion']} — \"{e['text']}\"" for i, e in enumerate(session_log[-10:]))
+            normalized.append({"role": "assistant", "content": f"Recent mood entries:\n{entries}"})
+        new_state = {"mode": mode, "last_emotion": last_emotion, "session_log": session_log}
+        return normalized, new_state
+
+    # If in support mode, treat input as emotional message
+    if mode == "support":
+        normalized.append({"role": "user", "content": user_message})
+
+        # Crisis check first
+        if crisis_screen(user_text):
+            # Immediate safe-referral wording
+            crisis_msg = (
+                "I'm really sorry you're feeling this way. I can't handle crisis situations fully. "
+                "If you're in immediate danger or feel you might harm yourself, please call your local emergency number right now. "
+                "If you can, consider contacting a trusted person or a local crisis line. "
+                "Would you like me to provide crisis helpline information for your country?"
+            )
+            normalized.append({"role": "assistant", "content": crisis_msg})
+            # do not log as normal emotion; preserve state
+            new_state = {"mode": "support", "last_emotion": "crisis", "session_log": session_log}
+            return normalized, new_state
+
+        detected = detect_emotion(user_text)
+        strategy = format_strategy(detected)
+
+        # Compose empathetic reply
+        if detected == "unsure":
+            reply = f"I couldn't quite tell how you're feeling. {strategy}"
+        else:
+            # gentle validation + strategy
+            reply = f"I hear that you're feeling **{detected}**. {strategy}"
+
+        normalized.append({"role": "assistant", "content": reply})
+
+        # Log into session_log with a short record
+        session_log.append({"emotion": detected, "text": user_text})
+
+        new_state = {"mode": "support", "last_emotion": detected, "session_log": session_log}
+        return normalized, new_state
+
+    # Not in support mode and not a command -> normal chat responses
+    normalized.append({"role": "user", "content": user_message})
+    low = user_text.lower()
+    if any(g in low for g in ["hi", "hello", "hey"]):
+        normalized.append({"role": "assistant", "content": "Hello! I can offer emotion-aware support. Type 'start support' to begin."})
+    elif "thank" in low:
+        normalized.append({"role": "assistant", "content": "You're welcome! If you'd like support, try 'start support'."})
+    else:
+        normalized.append({"role": "assistant", "content": "I can help with quick emotional support. Type 'start support' to begin or 'help' for commands."})
+
+    new_state = {"mode": mode, "last_emotion": last_emotion, "session_log": session_log}
+    return normalized, new_state
+
+
+# -----------------------------
+# Gradio UI helpers and state
+# -----------------------------
+def respond_and_return_history(user_text, history, state):
+    if state is None:
+        state = {"mode": "idle", "last_emotion": None, "session_log": []}
+    new_history, new_state = get_reply(user_text, history, state)
+    return new_history, "", new_state
+
+
+# -----------------------------
+# Build Gradio app
+# -----------------------------
+with gr.Blocks() as demo:
+    gr.Markdown("## Emotion-Control Chatbot")
+    gr.Markdown("Type 'start support' to begin. In support mode, tell me how you're feeling and I'll respond with validation and a short coping suggestion.")
+    chatbot = gr.Chatbot(type="messages")
+    txt = gr.Textbox(placeholder="Type a message and press Enter...")
+    clear = gr.Button("Clear Chat")
+    state = gr.State({"mode": "idle", "last_emotion": None, "session_log": []})
+
+    txt.submit(respond_and_return_history, [txt, chatbot, state], [chatbot, txt, state])
+    clear.click(lambda: ([], "", {"mode": "idle", "last_emotion": None, "session_log": []}), None, [chatbot, txt, state])
+
+# Launch
+port = int(os.environ.get("PORT", 3000))
+demo.launch(server_name="0.0.0.0", server_port=port)
